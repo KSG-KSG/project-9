@@ -1,7 +1,7 @@
 # PRD — 한붓그리기 대결 (One-Stroke Duel)
 
-> 버전 0.2 · 2026-11-22 · 상태: 초안
-> 변경: 한 기기 대결 → **휴대폰 두 대 실시간 네트워크 대결**을 핵심으로 재구성
+> 버전 0.3 · 2026-11-22 · 상태: 초안
+> 변경: v0.2 두 기기 네트워크 대결로 재구성 · v0.3 인프라 확정 (Vercel + Node.js 게임 서버 + Supabase)
 
 ## 1. 개요
 
@@ -65,25 +65,62 @@ A: B의 선이 실시간으로 그려지는 걸 관전  B: 풀이 (타이머 60�
 **결정: A. 클라이언트 ↔ 서버 ↔ 클라이언트 (Star 구조), 서버가 게임 상태의 유일한 진실(Single Source of Truth).**
 턴제 + 칸 단위 입력이라 대역폭·지연 요구가 낮아 P2P의 이점이 작고, "정답을 상대에게 숨긴다"는 요구 때문에 판정자가 반드시 제3자(서버)여야 한다.
 
-### 3.2 전체 구성
+### 3.2 전체 구성 (Vercel + Supabase + Node.js 게임 서버)
+
+> **제약**: Vercel 서버리스 함수는 요청이 끝나면 종료되므로 **WebSocket 연결을 유지할 수 없다.**
+> → 실시간 게임 서버(Node.js)는 상시 실행되는 호스트에 따로 띄우고, Vercel·Supabase는 각자 잘하는 역할만 맡는다.
 
 ```
-┌──────────┐   wss://   ┌─────────────────────────────┐   wss://   ┌──────────┐
-│  폰 A     │ ◀───────▶ │  Game Server (Node.js + ws) │ ◀───────▶ │  폰 B     │
-│ (브라우저) │           │                             │           │ (브라우저) │
-│ - 렌더링   │           │  RoomManager                │           │          │
-│ - 입력     │           │   └ Room "4827"             │           │          │
-│ - 예측 반영│           │       ├ state machine       │           │          │
-└──────────┘           │       ├ puzzle (정답 포함)   │           └──────────┘
-                       │       ├ solver path         │
-                       │       └ timers              │
-                       └─────────────────────────────┘
-정적 파일(index.html, js)은 같은 서버 또는 GitHub Pages에서 제공
+                     ┌──────────────── Vercel ────────────────┐
+  폰 A / 폰 B  ──https──▶ 클라이언트 (Next.js 또는 정적 HTML)   │
+      │               │  /api/* : 전적 조회 등 일반 API (선택)  │
+      │               └────────────────────────────────────────┘
+      │ wss://game.<도메인>
+      ▼
+┌─────────────── Railway (또는 Fly.io) ───────────────┐        ┌──────── Supabase ────────┐
+│  Game Server: Node.js 20 + ws                       │        │ Postgres                 │
+│   RoomManager → Room "4827" (상태·정답·타이머, 메모리)│──────▶│  matches, rounds (전적)  │
+│   매치 종료 시 결과 저장 (service_role 키)            │        │ Auth (선택: 익명/카카오) │
+└─────────────────────────────────────────────────────┘        └──────────────────────────┘
 ```
 
-- **클라이언트**: 바닐라 JS, Canvas/SVG 렌더링, `WebSocket` API
-- **서버**: Node.js 20 + `ws` 라이브러리, 방 상태는 메모리 보관 (단일 인스턴스)
-- **배포**: Fly.io / Render / Railway 중 하나 (WebSocket 지원, 무료~저가)
+| 구성 요소 | 역할 | 비고 |
+|---|---|---|
+| **Vercel** | 클라이언트 호스팅, (선택) 전적 조회 API | 기존 사용 중 |
+| **Node.js 게임 서버** | WebSocket, 방·상태 머신·검증·판정·타이머 (권위 서버) | Railway 권장 (항상 켜짐, 슬립 없음, 월 $5 내외). Render 무료 플랜은 15분 무활동 시 슬립 → 첫 접속 수십 초 지연이라 비권장 |
+| **Supabase** | 매치 결과·전적 영구 저장, (선택) 로그인 | 실시간 진행 데이터는 저장하지 않음 (지연·쓰기 비용) |
+
+- 진행 중인 방 상태는 **게임 서버 메모리**에만 둔다 (빠르고 단순). 서버 재시작 시 진행 중 방은 소멸 — 취미 규모에선 허용.
+- 클라이언트는 `NEXT_PUBLIC_GAME_SERVER_URL` 환경변수로 게임 서버 주소를 받음.
+- 게임 서버 CORS/Origin 검사: Vercel 도메인(+ 로컬)에서 온 WebSocket만 허용.
+- (선택) Supabase Auth를 쓰면 클라이언트가 `access_token`을 `join_room`에 실어 보내고, 게임 서버가 Supabase JWT 시크릿으로 검증 → 전적을 유저에 귀속.
+
+**검토했지만 채택하지 않은 안: Vercel 함수 + Supabase Realtime만 사용**
+이동마다 `POST /api/move`(Vercel 함수) → DB 기록 → Realtime으로 양쪽에 전파. 새 호스트가 필요 없지만, 입력 1회당 HTTP + DB 쓰기 + Realtime 전파를 거쳐 지연이 커지고(콜드 스타트 포함 수백 ms), 시간 초과 판정을 위한 서버 타이머가 없어 pg_cron이나 지연 판정으로 우회해야 한다. 실시간 관전이 핵심인 이 게임엔 부적합.
+
+#### Supabase 테이블 (전적)
+
+```sql
+create table matches (
+  id uuid primary key default gen_random_uuid(),
+  room_code text not null,
+  player_a text not null, player_b text not null,      -- 닉네임 (Auth 쓰면 user_id 추가)
+  score_a int not null,  score_b int not null,
+  winner text,
+  created_at timestamptz default now()
+);
+create table rounds (
+  id bigserial primary key,
+  match_id uuid references matches on delete cascade,
+  round int not null, setter text not null, solver text not null,
+  rows int not null, cols int not null,
+  cells text not null,          -- 활성 칸 비트열
+  solution int[] not null,      -- 출제자 경로 (매치 종료 후에만 저장되므로 공개 OK)
+  result text not null,         -- solved | timeout | gaveup | left
+  time_ms int, resets int
+);
+-- RLS: 읽기는 누구나(또는 본인), 쓰기는 게임 서버(service_role)만
+```
 
 ### 3.3 방(Room) 상태 머신 — 서버가 관리
 
@@ -239,32 +276,33 @@ A: B의 선이 실시간으로 그려지는 걸 관전  B: 풀이 (타이머 60�
 
 ```
 project-9/
-├── client/
-│   ├── index.html
-│   ├── game.js        # 격자 렌더링, 입력
-│   ├── net.js         # WebSocket 래퍼: 재연결, seq, ping/시계 보정
-│   └── screens.js     # 로비/출제/풀이/관전/결과 화면
-├── server/
-│   ├── server.js      # HTTP(정적 파일) + ws 엔드포인트
-│   ├── room.js        # Room 클래스, 상태 머신, 타이머
-│   ├── rules.js       # 경로 검증, 판정, 점수 (순수 함수)
-│   └── rules.test.js
-├── shared/
-│   └── protocol.js    # 메시지 타입 상수 (클라/서버 공유)
+├── apps/
+│   ├── web/                 # Vercel 배포 (Next.js 또는 정적 HTML)
+│   │   ├── game/board.js    # 격자 렌더링, 입력
+│   │   ├── game/net.js      # WebSocket 래퍼: 재연결, seq, ping/시계 보정
+│   │   └── screens/         # 로비/출제/풀이/관전/결과
+│   └── server/              # Railway 배포 (Node.js)
+│       ├── index.js         # HTTP 헬스체크 + ws 엔드포인트, Origin 검사
+│       ├── room.js          # Room 클래스, 상태 머신, 타이머
+│       ├── rules.js         # 경로 검증, 판정, 점수 (순수 함수)
+│       ├── store.js         # Supabase에 매치 결과 저장
+│       └── rules.test.js
+├── packages/shared/protocol.js   # 메시지 타입 상수 (web/server 공유)
+├── supabase/migrations/          # matches, rounds 테이블 + RLS
 └── docs/PRD.md
 ```
 
 ## 8. 마일스톤
 | 단계 | 범위 | 확인 방법 |
 |---|---|---|
-| M1 | N1·N2: 방 만들고 두 브라우저 탭이 서로 "연결됨" 확인 | 로컬 탭 2개 |
+| M1 | N1·N2: 방 만들고 두 브라우저 탭이 서로 "연결됨" 확인 | 로컬 (web + server 동시 실행) |
 | M2 | G1·N3·N4·N5: 출제 → 상대 풀이 → 실시간 관전 | 로컬 탭 2개 |
 | M3 | N6·N7: 타이머, 끊고 다시 붙기 | 비행기 모드 on/off 테스트 |
-| M4 | 배포 + 실제 휴대폰 2대 테스트 → **MVP** | 실기기 2대 (Wi-Fi + LTE) |
-| M5 | N8–N12, G2–G3 | |
+| M4 | 배포: web → Vercel, server → Railway, Supabase 전적 저장 → **MVP** | 실기기 2대 (Wi-Fi + LTE) |
+| M5 | N8–N12, G2–G3, (선택) Supabase Auth | |
 
 ## 9. 열린 질문
-1. 서버를 직접 운영(Node + Fly.io)할지, Cloudflare Durable Objects로 처음부터 갈지? → 학습 목적이면 Node 권장
+1. ~~게임 서버 방식~~ → **결정: Node.js (Railway), 클라이언트 Vercel, 전적 Supabase**
 2. 도전자가 끊겼을 때 타이머 일시정지 악용(일부러 끊고 생각하기)을 막을지? → 라운드당 일시정지 1회 / 총 30초로 제한 검토
 3. 시작점 비공개를 기본값으로 할지?
 4. 같은 문제를 둘이 **동시에** 푸는 "스피드전" 모드를 추가할지? (현재 구조에서 `solver`를 2명으로 확장하면 가능)

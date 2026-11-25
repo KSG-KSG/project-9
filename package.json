@@ -1,0 +1,17 @@
+{
+  "name": "one-stroke-duel",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c magenta,cyan \"npm run dev -w apps/server\" \"npm run dev -w apps/web\"",
+    "test": "npm test -w packages/shared -w apps/server",
+    "build": "npm run build -w apps/web",
+    "start:server": "npm start -w apps/server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

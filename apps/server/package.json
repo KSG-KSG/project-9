@@ -1,0 +1,17 @@
+{
+  "name": "@duel/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@duel/shared": "*",
+    "ws": "^8.18.3"
+  }
+}
